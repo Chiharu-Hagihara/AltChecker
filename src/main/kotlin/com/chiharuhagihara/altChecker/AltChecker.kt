@@ -88,34 +88,59 @@ class AltChecker : JavaPlugin(), Listener, CommandExecutor {
         }
 
         server.scheduler.runTaskAsynchronously(this, Runnable {
-            val ipAddress = if (isIpQuery(query)) {
-                normalizeIp(query)
-            } else {
-                manager.findIpByPlayerName(query)?.let { normalizeIp(it) }
+            if (isIpQuery(query)) {
+                val ipAddress = normalizeIp(query)
+                if (ipAddress == null) {
+                    server.scheduler.runTask(this, Runnable {
+                        sender.sendMessage(prefixedMessage("IP形式が正しくありません。", NamedTextColor.RED))
+                    })
+                    return@Runnable
+                }
+
+                val relatedPlayers = manager.findPlayersByIp(ipAddress)
+                server.scheduler.runTask(this, Runnable {
+                    if (relatedPlayers.isEmpty()) {
+                        sender.sendMessage(prefixedMessage("IP: $ipAddress に一致するプレイヤーが見つかりません。", NamedTextColor.RED))
+                        return@Runnable
+                    }
+
+                    sender.sendMessage(
+                        prefixedMessage(
+                            "IP: $ipAddress | プレイヤー: ${relatedPlayers.joinToString(", ")}",
+                            NamedTextColor.AQUA
+                        )
+                    )
+                    notifyStaff(
+                        "[検索] ${sender.name} が IP '$ipAddress' を検索: ${relatedPlayers.joinToString(", ")}",
+                        ignorePlayerName = sender.name
+                    )
+                })
+                return@Runnable
             }
 
-            if (ipAddress == null) {
+            val ips = manager.findIpsByPlayerName(query)
+            if (ips.isEmpty()) {
                 server.scheduler.runTask(this, Runnable {
                     sender.sendMessage(prefixedMessage("'$query' のIPデータが見つかりません。", NamedTextColor.RED))
                 })
                 return@Runnable
             }
 
-            val relatedPlayers = manager.findPlayersByIp(ipAddress)
+            val relatedPlayers = manager.findPlayersByIps(ips)
             server.scheduler.runTask(this, Runnable {
                 if (relatedPlayers.isEmpty()) {
-                    sender.sendMessage(prefixedMessage("IP: $ipAddress に一致するプレイヤーが見つかりません。", NamedTextColor.RED))
+                    sender.sendMessage(prefixedMessage("'$query' に関連するプレイヤーが見つかりません。", NamedTextColor.RED))
                     return@Runnable
                 }
 
                 sender.sendMessage(
                     prefixedMessage(
-                        "IP: $ipAddress | プレイヤー: ${relatedPlayers.joinToString(", ")}",
+                        "プレイヤー: $query | IP(${ips.size}件): ${ips.joinToString(", ")} | 関連: ${relatedPlayers.joinToString(", ")}",
                         NamedTextColor.AQUA
                     )
                 )
                 notifyStaff(
-                    "[検索] ${sender.name} が '$query' を検索 -> $ipAddress: ${relatedPlayers.joinToString(", ")}",
+                    "[検索] ${sender.name} が '$query' を全IP横断検索 -> IP(${ips.size}): ${ips.joinToString(", ")} | 関連: ${relatedPlayers.joinToString(", ")}",
                     ignorePlayerName = sender.name
                 )
             })

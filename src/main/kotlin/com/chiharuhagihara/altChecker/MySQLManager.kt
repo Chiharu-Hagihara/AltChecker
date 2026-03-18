@@ -21,6 +21,7 @@ class MySQLManager(
     init {
         this.connect()
         this.createTableIfNeeded()
+        this.migrateLegacySchemaIfNeeded()
     }
 
     fun connect(): Boolean {
@@ -44,12 +45,14 @@ class MySQLManager(
     private fun createTableIfNeeded() {
         val sql = """
             CREATE TABLE IF NOT EXISTS player_ips (
-                uuid VARCHAR(36) PRIMARY KEY,
+                uuid VARCHAR(36) NOT NULL,
                 player_name VARCHAR(16) NOT NULL,
                 ip_address VARCHAR(45) NOT NULL,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                UNIQUE KEY uq_uuid_ip (uuid, ip_address),
                 INDEX idx_ip_address (ip_address),
-                INDEX idx_player_name (player_name)
+                INDEX idx_player_name_last_seen (player_name, last_seen)
             )
         """.trimIndent()
 
@@ -62,24 +65,77 @@ class MySQLManager(
         }
     }
 
+    private fun migrateLegacySchemaIfNeeded() {
+        val alterAddColumns = """
+            ALTER TABLE player_ips
+            ADD COLUMN IF NOT EXISTS first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            ADD COLUMN IF NOT EXISTS last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        """.trimIndent()
+
+        val addUniqueIndex = "CREATE UNIQUE INDEX uq_uuid_ip ON player_ips (uuid, ip_address)"
+
+        val dropLegacyPrimary = "ALTER TABLE player_ips DROP PRIMARY KEY"
+
+        val backfillSeenFromLegacy = """
+            UPDATE player_ips
+            SET
+                first_seen = COALESCE(first_seen, updated_at, CURRENT_TIMESTAMP),
+                last_seen = COALESCE(last_seen, updated_at, CURRENT_TIMESTAMP)
+        """.trimIndent()
+
+        try {
+            connection?.createStatement()?.use { statement ->
+                statement.execute(alterAddColumns)
+
+                try {
+                    statement.execute(dropLegacyPrimary)
+                } catch (_: SQLException) {
+                    // Legacy primary key may already be removed.
+                }
+
+                try {
+                    statement.execute(addUniqueIndex)
+                } catch (_: SQLException) {
+                    // Index may already exist.
+                }
+
+                try {
+                    statement.execute(backfillSeenFromLegacy)
+                } catch (_: SQLException) {
+                    // Legacy updated_at may not exist in fresh schema.
+                }
+            }
+        } catch (e: SQLException) {
+            plugin.logger.log(Level.SEVERE, "Could not migrate player_ips schema. ${e.message}")
+        }
+    }
+
     fun upsertPlayerIp(uuid: String, playerName: String, ipAddress: String): Boolean {
+        val updateNameSql = "UPDATE player_ips SET player_name = ? WHERE uuid = ?"
         val sql = """
             INSERT INTO player_ips (uuid, player_name, ip_address)
             VALUES (?, ?, ?)
             ON DUPLICATE KEY UPDATE
                 player_name = VALUES(player_name),
-                ip_address = VALUES(ip_address)
+                last_seen = CURRENT_TIMESTAMP
         """.trimIndent()
 
-        return executePrepared(sql) { statement ->
+        val updatedNames = executePrepared(updateNameSql) { statement ->
+            statement.setString(1, playerName)
+            statement.setString(2, uuid)
+        }
+
+        val upserted = executePrepared(sql) { statement ->
             statement.setString(1, uuid)
             statement.setString(2, playerName)
             statement.setString(3, ipAddress)
         }
+
+        return updatedNames && upserted
     }
 
     fun findPlayersByIp(ipAddress: String): List<String> {
-        val sql = "SELECT player_name FROM player_ips WHERE ip_address = ? ORDER BY updated_at DESC"
+        val sql = "SELECT player_name FROM player_ips WHERE ip_address = ? ORDER BY last_seen DESC"
         return queryPrepared(sql, { statement ->
             statement.setString(1, ipAddress)
         }) { rs ->
@@ -91,13 +147,51 @@ class MySQLManager(
         } ?: emptyList()
     }
 
-    fun findIpByPlayerName(playerName: String): String? {
-        val sql = "SELECT ip_address FROM player_ips WHERE player_name = ? LIMIT 1"
+    fun findIpsByPlayerName(playerName: String): List<String> {
+        val sql = """
+            SELECT ip_address, MAX(last_seen) AS latest_seen
+            FROM player_ips
+            WHERE player_name = ?
+            GROUP BY ip_address
+            ORDER BY latest_seen DESC
+        """.trimIndent()
+
         return queryPrepared(sql, { statement ->
             statement.setString(1, playerName)
         }) { rs ->
-            if (rs.next()) rs.getString("ip_address") else null
+            val ips = mutableListOf<String>()
+            while (rs.next()) {
+                ips.add(rs.getString("ip_address"))
+            }
+            ips
+        } ?: emptyList()
+    }
+
+    fun findPlayersByIps(ipAddresses: List<String>): List<String> {
+        if (ipAddresses.isEmpty()) {
+            return emptyList()
         }
+
+        val placeholders = ipAddresses.joinToString(",") { "?" }
+        val sql = """
+            SELECT player_name, MAX(last_seen) AS latest_seen
+            FROM player_ips
+            WHERE ip_address IN ($placeholders)
+            GROUP BY player_name
+            ORDER BY latest_seen DESC
+        """.trimIndent()
+
+        return queryPrepared(sql, { statement ->
+            ipAddresses.forEachIndexed { index, ip ->
+                statement.setString(index + 1, ip)
+            }
+        }) { rs ->
+            val players = mutableListOf<String>()
+            while (rs.next()) {
+                players.add(rs.getString("player_name"))
+            }
+            players
+        } ?: emptyList()
     }
 
     private fun executePrepared(
