@@ -1,0 +1,13 @@
+name: AltChecker
+version: '${version}'
+main: com.chiharuhagihara.altChecker.AltChecker
+api-version: '1.21'
+commands:
+  altcheck:
+	description: 同じIPのプレイヤーを検索します
+	usage: /altcheck <プレイヤー名|IP>
+	permission: altchecker.staff
+permissions:
+  altchecker.staff:
+	description: AltCheckerの通知受信と /altcheck の実行を許可します
+	default: op
